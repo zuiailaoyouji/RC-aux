@@ -62,3 +62,21 @@ to a goal latent internally. It does not directly accept a pre-encoded goal
 latent. `RCAuxAdapter` adds a numerically equivalent latent-goal cost path for
 hierarchical planning while preserving the original image-goal path for
 regression testing.
+
+## Full Checkpoint Goal-Path Regression
+
+Run the full official TwoRoom CEM configuration on GPU to compare the image-goal
+and latent-goal planner paths end to end:
+
+```bash
+python tools/compare_adapter_goal_paths.py \
+  --device cuda \
+  --output outputs/adapter_goal_path_full.json \
+  --fail-on-mismatch
+```
+
+The defaults match the official TwoRoom planner: 5 model-step planning and
+execution horizons, 5 environment steps per model step, 300 candidates, 30 CEM
+iterations, top-k 30, and seed 42. Both paths use fresh solvers with warm start
+disabled. The JSON report compares normalized action blocks, the complete
+environment-step plan, the execution prefix, and final CEM costs.
