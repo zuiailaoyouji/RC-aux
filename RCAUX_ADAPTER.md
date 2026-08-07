@@ -80,3 +80,24 @@ execution horizons, 5 environment steps per model step, 300 candidates, 30 CEM
 iterations, top-k 30, and seed 42. Both paths use fresh solvers with warm start
 disabled. The JSON report compares normalized action blocks, the complete
 environment-step plan, the execution prefix, and final CEM costs.
+
+## Future-Latent Subgoal Oracle
+
+Use a real future observation from the official dataset as a latent subgoal,
+`g = E(o_{t+k})`, and run closed-loop control in the real TwoRoom environment:
+
+```bash
+python tools/run_latent_subgoal_oracle.py \
+  --device cuda \
+  --future-k-env-steps 25 \
+  --require-replay-match \
+  --require-success
+```
+
+The environment starts at the dataset state at `t` and uses the dataset state at
+`t+k` only as the environment success target. The planner receives only the
+encoded latent goal. It replans after one model step, which is five environment
+steps for TwoRoom. The output JSON records state distances, executed actions,
+reachability probabilities, warm-start decisions, and planner diagnostics. The
+video places the live environment on the left and `o_{t+k}` on the right. Replay
+validation permits a maximum uint8 pixel difference of one by default.
