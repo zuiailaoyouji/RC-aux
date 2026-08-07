@@ -617,11 +617,13 @@ class RCAuxAdapter:
 
         self._next_init = None
 
-    def reset_planner(self) -> None:
-        """Discard cached actions and the active subgoal identity."""
+    def reset_planner(self, *, seed: int | None = None) -> None:
+        """Discard planner state and optionally reset the CEM generator."""
 
         self._next_init = None
         self._goal_signature = None
+        if seed is not None:
+            self._solver.torch_gen.manual_seed(int(seed))
 
     @staticmethod
     def _tensor_signature(mode: str, value: torch.Tensor) -> str:

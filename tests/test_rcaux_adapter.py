@@ -372,6 +372,17 @@ def test_new_subgoal_resets_previous_plan_warm_start():
     assert changed.diagnostics.warm_start_reset_reason == "subgoal_changed"
 
 
+def test_reset_planner_can_restore_cem_random_stream():
+    adapter = make_adapter()
+
+    adapter.reset_planner(seed=19)
+    first = torch.randn(4, generator=adapter._solver.torch_gen)
+    adapter.reset_planner(seed=19)
+    repeated = torch.randn(4, generator=adapter._solver.torch_gen)
+
+    assert torch.equal(first, repeated)
+
+
 def test_unified_plan_requires_exactly_one_goal_representation():
     adapter = make_adapter()
     observation = np.zeros((224, 224, 3), dtype=np.uint8)

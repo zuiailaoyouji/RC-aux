@@ -144,3 +144,52 @@ state distances, executed actions,
 reachability probabilities, warm-start decisions, and planner diagnostics. The
 video places the live environment on the left and `o_{t+k}` on the right. Replay
 validation permits a maximum uint8 pixel difference of one by default.
+
+## Oracle RC Filtering Experiment
+
+Evaluate the reachability filter before training a latent subgoal generator:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 MPLCONFIGDIR=/tmp/matplotlib-rcaux \
+.venv/bin/python tools/evaluate_rc_oracle_filter.py \
+  --device cuda \
+  --cache-dir /home/sxw/work/datasets/stable-wm \
+  --tau-model-steps 3 \
+  --eta-r 0.5 \
+  --num-trials 10 \
+  --output outputs/rc_oracle_filter_tau3.json
+```
+
+Each trial builds one Oracle candidate pool from real dataset observations. It
+contains same-trajectory candidates at offsets within three model steps,
+same-trajectory candidates at offsets beyond three model steps, and candidates
+from other trajectories whose conservative displacement lower bound exceeds the
+15-environment-step budget. The over-budget label describes temporal offset in
+the demonstrated trajectory; it is not a shortest-path proof. Actual feasibility
+is always measured by closed-loop execution in the environment.
+
+The fixed threshold first removes candidates with
+`R_phi(z_t, g_i, tau) < eta_r`. For each candidate and the current state, the
+experiment queries the frozen reachability head toward the final goal at model
+step horizons `H={1,2,3,4,5}` and computes
+`D_phi(a,z_G)=sum_h(1-R_phi(a,z_G,h))`. Predicted progress is
+`D_phi(z_t,z_G)-D_phi(g_i,z_G)`. The filtered strategy also rejects non-positive
+progress and selects the remaining candidate with minimum `D_phi(g_i,z_G)`.
+The progress-only baseline applies the same positive-progress and minimum-time
+rule without local RC filtering. The random baseline samples from the complete
+Oracle pool.
+
+Every candidate is executed once with the same CEM seed within a trial. Results
+for all three strategies are then derived from that shared execution table. Each
+execution uses planning horizons `3, 2, 1`, executes one model step (five
+environment steps), observes the real state, and replans. The JSON report includes
+category pass/completion rates, threshold confusion statistics, ROC AUC, average
+precision, strategy completion rates, physical and reachability-time progress
+toward the final task goal, paired comparisons, and a threshold sweep.
+`ready_to_train_high_level_generator` is true only when the pre-fixed RC strategy
+strictly beats both baselines in completion rate and physical distance progress
+toward the final task goal, and local RC score ROC AUC is greater than 0.5. The
+physical metric keeps the validation independent of the RC head; reachability-time
+progress remains an auxiliary diagnostic. A false verdict is written to the
+report and returned as process exit status 1; it is an experimental result, not
+necessarily a runtime failure.
