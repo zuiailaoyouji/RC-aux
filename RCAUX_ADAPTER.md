@@ -28,9 +28,16 @@ probability = adapter.reachability(
     horizon_model_steps=5,
 )
 
-# Primary hierarchical-planning path: goal_latent is [B, 192].
-plan = adapter.plan_to_latent(observation, goal_latent)
+# High level returns (g_star, tau_star); tau_star initializes h_rem.
+h_rem_model_steps = tau_star_model_steps
+plan = adapter.plan_to_latent(
+    observation,
+    g_star,  # [B, 192]
+    planning_horizon_model_steps=h_rem_model_steps,
+    execution_horizon_model_steps=1,
+)
 actions = plan.actions_to_execute_env_steps
+h_rem_model_steps -= 1
 
 # Official image-goal path retained for regression tests.
 image_plan = adapter.plan_to_image(observation, goal_image)
@@ -48,6 +55,26 @@ is executed before the next high-level decision. The environment profile defines
 `model_step_env_steps`; for TwoRoom one model step is five environment steps.
 `PlanResult.planned_actions_env_steps` contains the full plan and
 `PlanResult.actions_to_execute_env_steps` contains only the execution prefix.
+
+The cross-level budget convention is:
+
+\[
+\begin{aligned}
+\text{High level:} \quad & (g^\star,\tau^\star) \\
+\text{Initialize:} \quad & h_{\mathrm{rem}}=\tau^\star \\
+\text{Low-level MPC:} \quad & H_{\mathrm{plan}}=h_{\mathrm{rem}} \\
+\text{Execute:} \quad & 1\ \text{model step} \\
+\text{Update:} \quad & h_{\mathrm{rem}}\leftarrow h_{\mathrm{rem}}-1 \\
+\text{Replan:} \quad & \text{same } g^\star,\ \text{smaller } H
+\end{aligned}
+\]
+
+`tau_star_model_steps` is therefore only the initial budget. On each planner
+call, pass the current `h_rem_model_steps` as
+`planning_horizon_model_steps`; this makes the actual low-level
+`PlanConfig.horizon` equal to `h_rem_model_steps`. The value can be a Python
+integer or scalar integer tensor. `execution_horizon_model_steps` is fixed to one
+for this loop and must never be folded into `h_rem_model_steps`.
 
 Changing either the latent or image subgoal automatically invalidates CEM warm
 start state. Planner diagnostics record both horizons in both units, CEM costs,
@@ -90,6 +117,7 @@ Use a real future observation from the official dataset as a latent subgoal,
 python tools/run_latent_subgoal_oracle.py \
   --device cuda \
   --future-k-env-steps 25 \
+  --tau-star-model-steps 5 \
   --require-replay-match \
   --require-success
 ```
@@ -97,7 +125,10 @@ python tools/run_latent_subgoal_oracle.py \
 The environment starts at the dataset state at `t` and uses the dataset state at
 `t+k` only as the environment success target. The planner receives only the
 encoded latent goal. It replans after one model step, which is five environment
-steps for TwoRoom. The output JSON records state distances, executed actions,
+steps for TwoRoom. The planning horizon follows the remaining cross-layer budget,
+so the default horizon sequence is `5, 4, 3, 2, 1` and execution stops after 25
+environment steps if the goal has not been reached. The output JSON records
+state distances, executed actions,
 reachability probabilities, warm-start decisions, and planner diagnostics. The
 video places the live environment on the left and `o_{t+k}` on the right. Replay
 validation permits a maximum uint8 pixel difference of one by default.

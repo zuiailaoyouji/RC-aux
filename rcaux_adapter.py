@@ -303,14 +303,18 @@ class RCAuxAdapter:
             return torch.device("cpu")
 
     @property
-    def planning_horizon_env_steps(self) -> int:
+    def default_planning_horizon_env_steps(self) -> int:
+        """Default planning horizon converted to environment steps."""
+
         return (
             self.planner_config.planning_horizon_model_steps
             * self.profile.model_step_env_steps
         )
 
     @property
-    def execution_horizon_env_steps(self) -> int:
+    def default_execution_horizon_env_steps(self) -> int:
+        """Default execution horizon converted to environment steps."""
+
         return (
             self.planner_config.execution_horizon_model_steps
             * self.profile.model_step_env_steps
@@ -700,6 +704,56 @@ class RCAuxAdapter:
         )
         return gym.spaces.Box(low=low, high=high, dtype=np.float32)
 
+    @staticmethod
+    def _scalar_model_step_count(value: Any, *, name: str) -> int:
+        count = torch.as_tensor(value)
+        if count.numel() != 1:
+            raise ValueError(f"{name} must be a scalar integer")
+        if count.dtype == torch.bool or count.is_complex():
+            raise ValueError(f"{name} must be an integer number of model steps")
+        if count.is_floating_point() and not torch.equal(count, count.round()):
+            raise ValueError(f"{name} must be an integer number of model steps")
+        return int(count.item())
+
+    def _resolve_plan_horizons(
+        self,
+        planning_horizon_model_steps: Any | None,
+        execution_horizon_model_steps: Any | None,
+    ) -> tuple[int, int]:
+        cfg = self.planner_config
+        planning = (
+            cfg.planning_horizon_model_steps
+            if planning_horizon_model_steps is None
+            else self._scalar_model_step_count(
+                planning_horizon_model_steps,
+                name="planning_horizon_model_steps",
+            )
+        )
+        execution = (
+            cfg.execution_horizon_model_steps
+            if execution_horizon_model_steps is None
+            else self._scalar_model_step_count(
+                execution_horizon_model_steps,
+                name="execution_horizon_model_steps",
+            )
+        )
+        if planning < 1:
+            raise ValueError("planning_horizon_model_steps must be positive")
+        if not 1 <= execution <= planning:
+            raise ValueError(
+                "execution_horizon_model_steps must be in "
+                "[1, planning_horizon_model_steps]"
+            )
+        if (
+            self.model.use_reachability_cost
+            and planning > self.max_reachability_horizon_model_steps
+        ):
+            raise ValueError(
+                "planning_horizon_model_steps exceeds the reachability head's "
+                f"maximum of {self.max_reachability_horizon_model_steps}"
+            )
+        return planning, execution
+
     @torch.inference_mode()
     def plan(
         self,
@@ -708,14 +762,23 @@ class RCAuxAdapter:
         goal_latent: Any | None = None,
         goal_image: Any | None = None,
         initial_action_blocks: Any | None = None,
+        planning_horizon_model_steps: Any | None = None,
+        execution_horizon_model_steps: Any | None = None,
         images_preprocessed: bool = False,
         force_reset_warm_start: bool = False,
     ) -> PlanResult:
         """Plan toward exactly one latent or image goal.
 
         Latent goals are the primary hierarchy-facing path. Image goals retain
-        the official policy path for regression tests.
+        the official policy path for regression tests. High-level ``tau_star``
+        initializes ``h_rem``; pass the current ``h_rem`` as
+        ``planning_horizon_model_steps`` on every closed-loop replan.
         """
+
+        planning_horizon, execution_horizon = self._resolve_plan_horizons(
+            planning_horizon_model_steps,
+            execution_horizon_model_steps,
+        )
 
         pixels = self._preprocess_images(
             observation,
@@ -745,8 +808,8 @@ class RCAuxAdapter:
 
         cfg = self.planner_config
         plan_cfg = swm.PlanConfig(
-            horizon=cfg.planning_horizon_model_steps,
-            receding_horizon=cfg.execution_horizon_model_steps,
+            horizon=planning_horizon,
+            receding_horizon=execution_horizon,
             history_len=pixels.size(1),
             action_block=self.profile.model_step_env_steps,
             warm_start=cfg.warm_start,
@@ -763,7 +826,7 @@ class RCAuxAdapter:
                 normalized=False,
                 expected_batch=batch,
             ).cpu()
-            if init.size(1) > cfg.planning_horizon_model_steps:
+            if init.size(1) > planning_horizon:
                 raise ValueError(
                     "initial_action_blocks exceeds planning_horizon_model_steps"
                 )
@@ -771,7 +834,7 @@ class RCAuxAdapter:
                 "explicit"
             )
         elif cfg.warm_start and self._next_init is not None:
-            init = self._next_init
+            init = self._next_init[:, :planning_horizon]
             warm_start_source = "previous_plan"
         else:
             init = None
@@ -790,18 +853,22 @@ class RCAuxAdapter:
         normalized_blocks = outputs["actions"]
 
         if cfg.warm_start:
-            remaining = normalized_blocks[
-                :, cfg.execution_horizon_model_steps :
-            ]
+            remaining = normalized_blocks[:, execution_horizon:]
             # CEMSolver pads a partial warm start on CPU before moving the
             # completed distribution to its configured solver device.
             self._next_init = remaining.cpu() if remaining.size(1) else None
         else:
             self._next_init = None
 
+        planning_horizon_env_steps = (
+            planning_horizon * self.profile.model_step_env_steps
+        )
+        execution_horizon_env_steps = (
+            execution_horizon * self.profile.model_step_env_steps
+        )
         planned_normalized = normalized_blocks.reshape(
             batch,
-            self.planning_horizon_env_steps,
+            planning_horizon_env_steps,
             self.profile.action_dim,
         )
         flat = planned_normalized.numpy().reshape(-1, self.profile.action_dim)
@@ -809,7 +876,7 @@ class RCAuxAdapter:
             planned_normalized.shape
         )
         planned_actions = planned_actions.astype(np.float32, copy=False)
-        actions_to_execute = planned_actions[:, : self.execution_horizon_env_steps]
+        actions_to_execute = planned_actions[:, :execution_horizon_env_steps]
 
         costs = np.asarray(outputs["costs"], dtype=np.float32)
         scaler_mean = tuple(float(value) for value in scaler.mean_)
@@ -818,11 +885,11 @@ class RCAuxAdapter:
             profile_name=self.profile.name,
             goal_mode=goal_mode,
             goal_signature=goal_signature,
-            planning_horizon_model_steps=cfg.planning_horizon_model_steps,
-            execution_horizon_model_steps=cfg.execution_horizon_model_steps,
+            planning_horizon_model_steps=planning_horizon,
+            execution_horizon_model_steps=execution_horizon,
             model_step_env_steps=self.profile.model_step_env_steps,
-            planning_horizon_env_steps=self.planning_horizon_env_steps,
-            execution_horizon_env_steps=self.execution_horizon_env_steps,
+            planning_horizon_env_steps=planning_horizon_env_steps,
+            execution_horizon_env_steps=execution_horizon_env_steps,
             warm_start_source=warm_start_source,
             warm_start_reset=warm_start_reset,
             warm_start_reset_reason=reset_reason,

@@ -40,11 +40,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-index", type=int, default=0)
     parser.add_argument("--t-env-step", type=int, default=0)
     parser.add_argument("--future-k-env-steps", type=int, default=25)
+    parser.add_argument(
+        "--tau-star-model-steps",
+        type=int,
+        help="High-level budget; defaults to ceil(k / model_step_env_steps).",
+    )
     parser.add_argument("--eval-budget-env-steps", type=int, default=50)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--planning-horizon-model-steps", type=int, default=5)
-    parser.add_argument("--execution-horizon-model-steps", type=int, default=1)
     parser.add_argument("--num-samples", type=int, default=300)
     parser.add_argument("--cem-iterations", type=int, default=30)
     parser.add_argument("--topk", type=int, default=30)
@@ -150,10 +153,27 @@ def main() -> int:
         args.t_env_step,
         args.future_k_env_steps,
     )
+    tau_star_model_steps = args.tau_star_model_steps
+    if tau_star_model_steps is None:
+        tau_star_model_steps = int(
+            np.ceil(
+                args.future_k_env_steps
+                / TWOROOM_PROFILE.model_step_env_steps
+            )
+        )
+    if tau_star_model_steps < 1:
+        raise ValueError("tau-star-model-steps must be positive")
+    cross_layer_budget_env_steps = (
+        tau_star_model_steps * TWOROOM_PROFILE.model_step_env_steps
+    )
+    rollout_budget_env_steps = min(
+        args.eval_budget_env_steps,
+        cross_layer_budget_env_steps,
+    )
 
     planner_config = RCAuxPlannerConfig(
-        planning_horizon_model_steps=args.planning_horizon_model_steps,
-        execution_horizon_model_steps=args.execution_horizon_model_steps,
+        planning_horizon_model_steps=tau_star_model_steps,
+        execution_horizon_model_steps=1,
         num_samples=args.num_samples,
         n_steps=args.cem_iterations,
         topk=args.topk,
@@ -231,21 +251,36 @@ def main() -> int:
         frames.append(np.hstack([source_render, oracle["target_image"]]))
 
         env_steps = 0
-        while env_steps < args.eval_budget_env_steps and not success:
+        while env_steps < rollout_budget_env_steps and not success:
+            executed_model_steps = (
+                env_steps // TWOROOM_PROFILE.model_step_env_steps
+            )
+            h_rem_model_steps = (
+                tau_star_model_steps - executed_model_steps
+            )
             current_image = env.render()
             current_latent = adapter.encode_observation(current_image)[:, -1]
             reachability = adapter.reachability(
                 current_latent,
                 goal_latent_bd,
-                horizon_model_steps=(
-                    adapter.max_reachability_horizon_model_steps
-                ),
+                horizon_model_steps=h_rem_model_steps,
             )
-            plan = adapter.plan_to_latent(current_image, goal_latent_bd)
+            plan = adapter.plan_to_latent(
+                current_image,
+                goal_latent_bd,
+                planning_horizon_model_steps=h_rem_model_steps,
+                execution_horizon_model_steps=1,
+            )
             plan_record = plan.diagnostics.to_log_dict()
             plan_record["replan_index"] = len(replans)
             plan_record["env_step_before_execution"] = env_steps
             plan_record["distance_before_execution"] = current_distance
+            plan_record["tau_star_model_steps"] = tau_star_model_steps
+            plan_record["h_rem_model_steps"] = h_rem_model_steps
+            plan_record["h_plan_model_steps"] = h_rem_model_steps
+            plan_record["h_rem_after_execution_model_steps"] = (
+                h_rem_model_steps - 1
+            )
             plan_record["reachability_probability"] = float(
                 reachability.item()
             )
@@ -266,7 +301,7 @@ def main() -> int:
                 frames.append(
                     np.hstack([env.render(), oracle["target_image"]])
                 )
-                if success or truncated or env_steps >= args.eval_budget_env_steps:
+                if success or truncated or env_steps >= rollout_budget_env_steps:
                     break
             if truncated:
                 break
@@ -286,12 +321,14 @@ def main() -> int:
         "device": args.device,
         "dataset_path": str(dataset_path),
         "oracle": {
-            "definition": "g = E(o_{t+k})",
+            "definition": "g_star = E(o_{t+k}), h_rem(0) = tau_star",
             "episode_index": oracle["episode_index"],
             "source_row": oracle["source_row"],
             "target_row": oracle["target_row"],
             "t_env_step": oracle["t_env_step"],
             "future_k_env_steps": oracle["future_k_env_steps"],
+            "tau_star_model_steps": tau_star_model_steps,
+            "cross_layer_budget_env_steps": cross_layer_budget_env_steps,
             "source_state": oracle["source_state"].tolist(),
             "target_state": oracle["target_state"].tolist(),
             "goal_latent_shape": list(goal_latent_bd.shape),
@@ -304,12 +341,10 @@ def main() -> int:
             "target": target_replay,
         },
         "planner": {
-            "planning_horizon_model_steps": (
-                args.planning_horizon_model_steps
-            ),
-            "execution_horizon_model_steps": (
-                args.execution_horizon_model_steps
-            ),
+            "planning_horizon_rule": "H_plan_model_steps = h_rem_model_steps",
+            "h_rem_initial_model_steps": tau_star_model_steps,
+            "h_rem_update_rule": "h_rem_model_steps -= 1",
+            "execution_horizon_model_steps": 1,
             "model_step_env_steps": TWOROOM_PROFILE.model_step_env_steps,
             "num_samples": args.num_samples,
             "cem_iterations": args.cem_iterations,
@@ -323,6 +358,11 @@ def main() -> int:
             "truncated": bool(truncated),
             "env_steps_executed": len(executed_actions),
             "replan_count": len(replans),
+            "cross_layer_budget_exhausted": bool(
+                not success
+                and len(executed_actions) >= cross_layer_budget_env_steps
+            ),
+            "rollout_budget_env_steps": rollout_budget_env_steps,
             "initially_within_success_radius": initially_within_success_radius,
             "initial_distance": initial_distance,
             "final_distance": final_distance,

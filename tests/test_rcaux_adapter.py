@@ -216,6 +216,51 @@ def test_latent_goal_is_primary_and_steps_are_explicit():
     json.dumps(result.diagnostics.to_log_dict())
 
 
+def test_h_rem_sets_low_level_planning_horizon():
+    adapter = make_adapter()
+    observation = np.zeros((224, 224, 3), dtype=np.uint8)
+    goal_latent = torch.zeros(1, 4)
+
+    result = adapter.plan_to_latent(
+        observation,
+        goal_latent,
+        planning_horizon_model_steps=torch.tensor(3),
+        execution_horizon_model_steps=1,
+    )
+
+    assert result.normalized_action_blocks.shape == (1, 3, 4)
+    assert result.planned_actions_env_steps.shape == (1, 6, 2)
+    assert result.actions_to_execute_env_steps.shape == (1, 2, 2)
+    assert result.diagnostics.planning_horizon_model_steps == 3
+    assert result.diagnostics.planning_horizon_env_steps == 6
+
+    with pytest.raises(ValueError, match="scalar integer"):
+        adapter.plan_to_latent(
+            observation,
+            goal_latent,
+            planning_horizon_model_steps=torch.tensor([2, 3]),
+        )
+    with pytest.raises(ValueError, match="integer number"):
+        adapter.plan_to_latent(
+            observation,
+            goal_latent,
+            planning_horizon_model_steps=2.5,
+        )
+    with pytest.raises(ValueError, match="reachability head"):
+        adapter.plan_to_latent(
+            observation,
+            goal_latent,
+            planning_horizon_model_steps=6,
+        )
+    with pytest.raises(ValueError, match="execution_horizon"):
+        adapter.plan_to_latent(
+            observation,
+            goal_latent,
+            planning_horizon_model_steps=1,
+            execution_horizon_model_steps=2,
+        )
+
+
 def test_image_goal_path_is_retained_for_regression():
     adapter = make_adapter()
     observation = np.zeros((224, 224, 3), dtype=np.uint8)
@@ -234,14 +279,25 @@ def test_new_subgoal_resets_previous_plan_warm_start():
     first_goal = torch.zeros(1, 4)
     second_goal = torch.ones(1, 4)
 
-    first = adapter.plan_to_latent(observation, first_goal)
+    first = adapter.plan_to_latent(
+        observation,
+        first_goal,
+        planning_horizon_model_steps=3,
+    )
     assert adapter._next_init is not None
     assert adapter._next_init.device.type == "cpu"
-    repeated = adapter.plan_to_latent(observation, first_goal)
+    assert adapter._next_init.shape[1] == 2
+    repeated = adapter.plan_to_latent(
+        observation,
+        first_goal,
+        planning_horizon_model_steps=1,
+    )
     changed = adapter.plan_to_latent(observation, second_goal)
 
     assert first.diagnostics.warm_start_source == "none"
+    assert first.diagnostics.planning_horizon_model_steps == 3
     assert repeated.diagnostics.warm_start_source == "previous_plan"
+    assert repeated.normalized_action_blocks.shape[1] == 1
     assert not repeated.diagnostics.warm_start_reset
     assert changed.diagnostics.warm_start_source == "none"
     assert changed.diagnostics.warm_start_reset
