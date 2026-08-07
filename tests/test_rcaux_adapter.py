@@ -235,6 +235,8 @@ def test_new_subgoal_resets_previous_plan_warm_start():
     second_goal = torch.ones(1, 4)
 
     first = adapter.plan_to_latent(observation, first_goal)
+    assert adapter._next_init is not None
+    assert adapter._next_init.device.type == "cpu"
     repeated = adapter.plan_to_latent(observation, first_goal)
     changed = adapter.plan_to_latent(observation, second_goal)
 

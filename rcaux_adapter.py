@@ -762,7 +762,7 @@ class RCAuxAdapter:
                 initial_action_blocks,
                 normalized=False,
                 expected_batch=batch,
-            )
+            ).cpu()
             if init.size(1) > cfg.planning_horizon_model_steps:
                 raise ValueError(
                     "initial_action_blocks exceeds planning_horizon_model_steps"
@@ -793,7 +793,9 @@ class RCAuxAdapter:
             remaining = normalized_blocks[
                 :, cfg.execution_horizon_model_steps :
             ]
-            self._next_init = remaining.to(self.device) if remaining.size(1) else None
+            # CEMSolver pads a partial warm start on CPU before moving the
+            # completed distribution to its configured solver device.
+            self._next_init = remaining.cpu() if remaining.size(1) else None
         else:
             self._next_init = None
 
