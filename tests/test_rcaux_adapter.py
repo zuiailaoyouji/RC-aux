@@ -47,7 +47,11 @@ class FakeModel(nn.Module):
         self.reachability_head = FakeReachabilityHead()
         self.image_goal_cost_calls = 0
         self.latent_goal_criterion_calls = 0
+        self.rollout_calls = 0
+        self.open_loop_calls = 0
         self.last_latent_goal_shape = None
+        self.last_predicted_emb_shape = None
+        self.last_open_loop_shapes = None
 
     def encode(self, info):
         pixels = info["pixels"]
@@ -63,6 +67,14 @@ class FakeModel(nn.Module):
         horizon,
         history_size,
     ):
+        self.open_loop_calls += 1
+        self.last_open_loop_shapes = {
+            "history_latents": tuple(emb_history.shape),
+            "history_actions": tuple(act_history.shape),
+            "future_actions": tuple(future_act_emb.shape),
+            "horizon": horizon,
+            "history_size": history_size,
+        }
         current = emb_history[:, -1:]
         predictions = []
         for step in range(horizon):
@@ -76,6 +88,7 @@ class FakeModel(nn.Module):
         return torch.cat(predictions, dim=1)
 
     def rollout(self, info, action_candidates, history_size):
+        self.rollout_calls += 1
         batch, samples, model_steps = action_candidates.shape[:3]
         increments = action_candidates.mean(dim=-1, keepdim=True)
         increments = increments.expand(-1, -1, -1, 4).cumsum(dim=2)
@@ -86,6 +99,7 @@ class FakeModel(nn.Module):
     def criterion(self, info):
         self.latent_goal_criterion_calls += 1
         prediction = info["predicted_emb"][:, :, -1]
+        self.last_predicted_emb_shape = tuple(info["predicted_emb"].shape)
         goal = info["goal_emb"]
         self.last_latent_goal_shape = tuple(goal.shape)
         return (prediction - goal).square().sum(dim=-1)
@@ -128,6 +142,10 @@ def make_adapter(**kwargs):
         action_scaler=IdentityScaler(),
         **kwargs,
     )
+
+
+def test_hierarchical_default_executes_one_model_step():
+    assert RCAuxPlannerConfig().execution_horizon_model_steps == 1
 
 
 def test_encode_observation_returns_btd_latent():
@@ -202,18 +220,68 @@ def test_latent_goal_is_primary_and_steps_are_explicit():
     result = adapter.plan_to_latent(observation, goal_latent)
 
     assert adapter.model.latent_goal_criterion_calls > 0
+    assert adapter.model.rollout_calls == 0
+    assert adapter.model.open_loop_calls > 0
+    assert adapter.model.last_predicted_emb_shape == (1, 4, 3, 4)
     assert adapter.model.image_goal_cost_calls == 0
     assert adapter.model.last_latent_goal_shape == (1, 1, 4)
     assert result.planned_actions_env_steps.shape == (1, 4, 2)
     assert result.actions_to_execute_env_steps.shape == (1, 2, 2)
     assert result.normalized_action_blocks.shape == (1, 2, 4)
     assert result.diagnostics.goal_mode == "latent"
+    assert result.diagnostics.rollout_mode == "rcaux_open_loop"
+    assert result.diagnostics.observation_history_model_steps == 1
+    assert result.diagnostics.history_action_blocks_model_steps == 0
+    assert result.diagnostics.predicted_future_latents_model_steps == 2
     assert result.diagnostics.planning_horizon_model_steps == 2
     assert result.diagnostics.execution_horizon_model_steps == 1
     assert result.diagnostics.planning_horizon_env_steps == 4
     assert result.diagnostics.execution_horizon_env_steps == 2
     assert result.diagnostics.to_log_dict()["profile_name"] == "test"
     json.dumps(result.diagnostics.to_log_dict())
+
+
+def test_latent_planner_keeps_history_and_future_horizon_independent():
+    adapter = make_adapter()
+    observation_history = np.zeros((1, 3, 224, 224, 3), dtype=np.uint8)
+    past_action_blocks = np.zeros((1, 2, 2, 2), dtype=np.float32)
+    goal_latent = torch.zeros(1, 4)
+
+    result = adapter.plan_to_latent(
+        observation_history,
+        goal_latent,
+        history_action_blocks=past_action_blocks,
+        planning_horizon_model_steps=1,
+        execution_horizon_model_steps=1,
+    )
+
+    assert result.normalized_action_blocks.shape == (1, 1, 4)
+    assert adapter.model.rollout_calls == 0
+    assert adapter.model.last_open_loop_shapes == {
+        "history_latents": (4, 3, 4),
+        "history_actions": (4, 3, 4),
+        "future_actions": (4, 0, 4),
+        "horizon": 1,
+        "history_size": 3,
+    }
+    assert adapter.model.last_predicted_emb_shape == (1, 4, 2, 4)
+    assert result.diagnostics.observation_history_model_steps == 3
+    assert result.diagnostics.history_action_blocks_model_steps == 2
+    assert result.diagnostics.predicted_future_latents_model_steps == 1
+
+    with pytest.raises(ValueError, match=r"requires exactly L-1=2"):
+        adapter.plan_to_latent(
+            observation_history,
+            goal_latent,
+            planning_horizon_model_steps=1,
+        )
+    with pytest.raises(ValueError, match="exceeds the model's maximum"):
+        adapter.plan_to_latent(
+            np.zeros((1, 4, 224, 224, 3), dtype=np.uint8),
+            goal_latent,
+            history_action_blocks=np.zeros((1, 3, 2, 2), dtype=np.float32),
+            planning_horizon_model_steps=1,
+        )
 
 
 def test_h_rem_sets_low_level_planning_horizon():

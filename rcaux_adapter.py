@@ -59,7 +59,7 @@ class RCAuxPlannerConfig:
     """Planner settings with explicit model-step units."""
 
     planning_horizon_model_steps: int = 5
-    execution_horizon_model_steps: int = 5
+    execution_horizon_model_steps: int = 1
     num_samples: int = 300
     n_steps: int = 30
     topk: int = 30
@@ -119,6 +119,10 @@ class PlannerDiagnostics:
     profile_name: str
     goal_mode: Literal["latent", "image"]
     goal_signature: str
+    rollout_mode: Literal["rcaux_open_loop", "official_image_goal"]
+    observation_history_model_steps: int
+    history_action_blocks_model_steps: int | None
+    predicted_future_latents_model_steps: int | None
     planning_horizon_model_steps: int
     execution_horizon_model_steps: int
     model_step_env_steps: int
@@ -147,6 +151,16 @@ class PlannerDiagnostics:
             "profile_name": self.profile_name,
             "goal_mode": self.goal_mode,
             "goal_signature": self.goal_signature,
+            "rollout_mode": self.rollout_mode,
+            "observation_history_model_steps": (
+                self.observation_history_model_steps
+            ),
+            "history_action_blocks_model_steps": (
+                self.history_action_blocks_model_steps
+            ),
+            "predicted_future_latents_model_steps": (
+                self.predicted_future_latents_model_steps
+            ),
             "planning_horizon_model_steps": self.planning_horizon_model_steps,
             "execution_horizon_model_steps": self.execution_horizon_model_steps,
             "model_step_env_steps": self.model_step_env_steps,
@@ -659,19 +673,70 @@ class RCAuxAdapter:
     ) -> torch.Tensor:
         info = dict(info_dict)
         goal_latent = info.pop("goal_latent").to(self.device)
+        history_action_blocks = info.pop("history_action_blocks").to(self.device)
         if goal_latent.ndim == 3:
             goal_latent = goal_latent[:, :1]
         elif goal_latent.ndim == 2:
             goal_latent = goal_latent.unsqueeze(1)
         else:
             raise ValueError("expanded goal_latent must be [B,N,D] or [B,D]")
-        info = self.model.rollout(
-            info,
-            action_candidates,
+
+        batch, samples, horizon = action_candidates.shape[:3]
+        initial = {
+            key: value[:, 0].to(self.device)
+            for key, value in info.items()
+            if torch.is_tensor(value)
+        }
+        encoded = self.model.encode(initial)
+        history_latents = encoded["emb"]
+        history_length = history_latents.size(1)
+        history_latents = (
+            history_latents.unsqueeze(1)
+            .expand(batch, samples, -1, -1)
+            .reshape(batch * samples, history_length, self.latent_dim)
+        )
+
+        candidate_blocks = action_candidates.reshape(
+            batch * samples,
+            horizon,
+            self.profile.action_block_dim,
+        )
+        candidate_action_emb = self.model.action_encoder(candidate_blocks)
+        if history_length > 1:
+            past_blocks = history_action_blocks.reshape(
+                batch * samples,
+                history_length - 1,
+                self.profile.action_block_dim,
+            )
+            past_action_emb = self.model.action_encoder(past_blocks)
+        else:
+            past_action_emb = candidate_action_emb.new_empty(
+                batch * samples,
+                0,
+                candidate_action_emb.size(-1),
+            )
+
+        aligned_history_action_emb = torch.cat(
+            [past_action_emb, candidate_action_emb[:, :1]],
+            dim=1,
+        )
+        future_latents = self.model.rollout_open_loop(
+            history_latents,
+            aligned_history_action_emb,
+            candidate_action_emb[:, 1:],
+            horizon=horizon,
             history_size=self.history_size_model_steps,
         )
-        info["goal_emb"] = goal_latent
-        cost = self.model.criterion(info)
+        source_and_future = torch.cat(
+            [history_latents[:, -1:], future_latents],
+            dim=1,
+        ).reshape(batch, samples, horizon + 1, self.latent_dim)
+        cost = self.model.criterion(
+            {
+                "predicted_emb": source_and_future,
+                "goal_emb": goal_latent,
+            }
+        )
 
         action_l2_weight = float(
             getattr(self.model, "action_l2_cost_weight", 0.0)
@@ -703,6 +768,50 @@ class RCAuxAdapter:
             (batch, self.profile.action_dim),
         )
         return gym.spaces.Box(low=low, high=high, dtype=np.float32)
+
+    def _planning_history_action_blocks(
+        self,
+        pixels: torch.Tensor,
+        history_action_blocks: Any | None,
+        *,
+        normalized: bool,
+    ) -> torch.Tensor:
+        history_length = pixels.size(1)
+        if history_length > self.history_size_model_steps:
+            raise ValueError(
+                f"observation history L={history_length} exceeds the model's "
+                f"maximum L={self.history_size_model_steps}"
+            )
+        required_blocks = history_length - 1
+        if required_blocks == 0:
+            if (
+                history_action_blocks is not None
+                and torch.as_tensor(history_action_blocks).numel() > 0
+            ):
+                raise ValueError(
+                    "history_action_blocks must be empty when observation L=1"
+                )
+            return pixels.new_empty(
+                pixels.size(0),
+                0,
+                self.profile.action_block_dim,
+            )
+        if history_action_blocks is None:
+            raise ValueError(
+                f"observation history L={history_length} requires exactly "
+                f"L-1={required_blocks} history action blocks"
+            )
+        blocks = self._action_blocks(
+            history_action_blocks,
+            normalized=normalized,
+            expected_batch=pixels.size(0),
+        )
+        if blocks.size(1) != required_blocks:
+            raise ValueError(
+                f"observation history L={history_length} requires exactly "
+                f"L-1={required_blocks} history action blocks"
+            )
+        return blocks
 
     @staticmethod
     def _scalar_model_step_count(value: Any, *, name: str) -> int:
@@ -762,6 +871,8 @@ class RCAuxAdapter:
         goal_latent: Any | None = None,
         goal_image: Any | None = None,
         initial_action_blocks: Any | None = None,
+        history_action_blocks: Any | None = None,
+        history_actions_normalized: bool = False,
         planning_horizon_model_steps: Any | None = None,
         execution_horizon_model_steps: Any | None = None,
         images_preprocessed: bool = False,
@@ -843,8 +954,28 @@ class RCAuxAdapter:
         info = {"pixels": pixels}
         if goal_mode == "latent":
             info["goal_latent"] = goal
+            prepared_history_action_blocks = (
+                self._planning_history_action_blocks(
+                    pixels,
+                    history_action_blocks,
+                    normalized=history_actions_normalized,
+                )
+            )
+            info["history_action_blocks"] = prepared_history_action_blocks
+            rollout_mode: Literal[
+                "rcaux_open_loop", "official_image_goal"
+            ] = "rcaux_open_loop"
+            history_action_blocks_model_steps = (
+                prepared_history_action_blocks.size(1)
+            )
+            predicted_future_latents_model_steps: int | None = (
+                planning_horizon
+            )
         else:
             info["goal"] = goal
+            rollout_mode = "official_image_goal"
+            history_action_blocks_model_steps = None
+            predicted_future_latents_model_steps = None
 
         scaler = self._get_action_scaler()
         started = time.perf_counter()
@@ -885,6 +1016,14 @@ class RCAuxAdapter:
             profile_name=self.profile.name,
             goal_mode=goal_mode,
             goal_signature=goal_signature,
+            rollout_mode=rollout_mode,
+            observation_history_model_steps=pixels.size(1),
+            history_action_blocks_model_steps=(
+                history_action_blocks_model_steps
+            ),
+            predicted_future_latents_model_steps=(
+                predicted_future_latents_model_steps
+            ),
             planning_horizon_model_steps=planning_horizon,
             execution_horizon_model_steps=execution_horizon,
             model_step_env_steps=self.profile.model_step_env_steps,

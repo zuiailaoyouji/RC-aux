@@ -49,6 +49,14 @@ in `[0, 1]`, and apply the official ImageNet preprocessing internally.
 action blocks and performs an open-loop rollout. `reachability` returns
 probabilities by default; pass `return_logits=True` for raw logits.
 
+The latent-goal planner also uses the checkpoint's RC-aux
+`rollout_open_loop`. For an observation history `[B,L,C,H,W]`, where `1<=L<=3`,
+provide the `L-1` previously executed action blocks through
+`history_action_blocks`. The first candidate action block is aligned with the
+latest history latent; the remaining `H_plan-1` candidates are future actions.
+The rollout therefore always returns exactly `H_plan=h_rem` future latents,
+independent of `L`. With `L=1`, no history action blocks are required.
+
 The adapter uses explicit units. `planning_horizon_model_steps` controls how far
 CEM plans, while `execution_horizon_model_steps` controls how much of that plan
 is executed before the next high-level decision. The environment profile defines
@@ -75,6 +83,10 @@ call, pass the current `h_rem_model_steps` as
 `PlanConfig.horizon` equal to `h_rem_model_steps`. The value can be a Python
 integer or scalar integer tensor. `execution_horizon_model_steps` is fixed to one
 for this loop and must never be folded into `h_rem_model_steps`.
+
+`RCAuxPlannerConfig` defaults `execution_horizon_model_steps` to one for the
+HRC-LeWM closed loop. Set it explicitly to five only when reproducing the
+official RC-aux open-loop evaluation protocol.
 
 Changing either the latent or image subgoal automatically invalidates CEM warm
 start state. Planner diagnostics record both horizons in both units, CEM costs,
