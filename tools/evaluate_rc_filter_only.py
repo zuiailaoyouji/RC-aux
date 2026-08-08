@@ -439,6 +439,7 @@ def execute_candidate(
     h_plan_sequence = []
     online_rc_sequence = []
     distances = []
+    final_state = np.asarray(source_state, dtype=np.float32)
     try:
         env.reset(seed=env_seed)
         base_env = env.unwrapped
@@ -487,6 +488,7 @@ def execute_candidate(
                 env_steps += 1
                 success = success or bool(terminated)
                 truncated = truncated or bool(step_truncated)
+                final_state = np.asarray(info["proprio"], dtype=np.float32)
                 distances.append(float(info["distance_to_target"]))
                 if success or truncated:
                     break
@@ -502,6 +504,7 @@ def execute_candidate(
         "initial_distance": distances[0],
         "final_distance": distances[-1],
         "minimum_distance": min(distances),
+        "final_state": final_state.tolist(),
         "h_plan_sequence": h_plan_sequence,
         "online_rc_sequence": online_rc_sequence,
     }
