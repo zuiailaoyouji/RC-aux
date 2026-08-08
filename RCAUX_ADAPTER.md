@@ -147,6 +147,11 @@ validation permits a maximum uint8 pixel difference of one by default.
 
 ## Oracle RC Filtering Experiment
 
+The experiment below is the earlier combined RC and `D_phi` pilot. Its overall
+verdict mixes feasibility filtering with progress ranking. For the strict,
+filter-only Stage 1/2 protocol, use `RC_FILTER_EXPERIMENT.md` and
+`tools/evaluate_rc_filter_only.py`.
+
 Evaluate the reachability filter before training a latent subgoal generator:
 
 ```bash
