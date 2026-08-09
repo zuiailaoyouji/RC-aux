@@ -1,7 +1,6 @@
 import json
 from collections import deque
 
-import h5py
 import numpy as np
 import pytest
 import torch
@@ -23,10 +22,11 @@ from stage4_generator import (
 )
 from tools.evaluate_stage4_closed_loop import (
     METHODS,
+    TWOROOM_OFFICIAL_MAX_EPISODE_STEPS,
     across_seed_paired_bootstrap,
     choose_subgoal,
-    demonstrations_within_budget,
     reference_trajectory_waypoint,
+    select_episode_records,
 )
 from tools.train_stage4_generator import parse_seeds
 
@@ -286,22 +286,21 @@ def test_stage2_threshold_must_match_stage3_and_stage4_metadata(tmp_path):
         )
 
 
-def test_closed_loop_episode_pool_respects_demonstration_budget(tmp_path):
-    dataset_path = tmp_path / "episodes.h5"
-    with h5py.File(dataset_path, "w") as handle:
-        handle.create_dataset("ep_len", data=np.asarray([51, 52, 40]))
+def test_closed_loop_episode_sampling_is_fixed_and_length_independent():
     episodes = [
-        {"episode_index": 0},
-        {"episode_index": 1},
-        {"episode_index": 2},
+        {"episode_index": index, "demonstration_env_steps": 20 + index * 50}
+        for index in range(10)
     ]
 
-    with h5py.File(dataset_path, "r") as handle:
-        eligible = demonstrations_within_budget(
-            handle, episodes, budget_env_steps=50
-        )
+    first = select_episode_records(episodes, count=6, seed=17)
+    second = select_episode_records(episodes, count=6, seed=17)
 
-    assert [item["episode_index"] for item in eligible] == [0, 2]
+    assert [item["episode_index"] for item in first] == [
+        item["episode_index"] for item in second
+    ]
+    assert len(first) == 6
+    assert max(item["demonstration_env_steps"] for item in first) > 100
+    assert TWOROOM_OFFICIAL_MAX_EPISODE_STEPS == 100
 
 
 def test_paired_bootstrap_aggregates_seeds_within_matched_episodes():
@@ -350,7 +349,7 @@ def test_paired_bootstrap_aggregates_seeds_within_matched_episodes():
 
     report = across_seed_paired_bootstrap(
         seed_results,
-        eval_budget_env_steps=50,
+        episode_horizon_env_steps=100,
         samples=100,
         seed=9,
     )

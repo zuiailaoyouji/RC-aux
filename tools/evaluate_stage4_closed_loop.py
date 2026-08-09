@@ -50,6 +50,8 @@ METHODS = (
     "stochastic32_rc_dpsi",
     "flat_rc_lewm",
 )
+TWOROOM_OFFICIAL_MAX_EPISODE_STEPS = 100
+DEFAULT_FORMAL_EPISODES = 150
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,8 +87,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="tworoom.h5")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-candidates", type=int, default=32)
-    parser.add_argument("--num-episodes", type=int, default=50)
-    parser.add_argument("--eval-budget-env-steps", type=int, default=50)
+    parser.add_argument("--num-episodes", type=int, default=DEFAULT_FORMAL_EPISODES)
+    parser.add_argument("--episode-sample-seed", type=int, default=20260811)
+    parser.add_argument(
+        "--episode-horizon-env-steps",
+        type=int,
+        default=TWOROOM_OFFICIAL_MAX_EPISODE_STEPS,
+    )
     parser.add_argument("--num-samples", type=int, default=300)
     parser.add_argument("--cem-iterations", type=int, default=30)
     parser.add_argument("--topk", type=int, default=30)
@@ -115,26 +122,13 @@ def select_episode_records(
     episodes: list[dict[str, Any]],
     *,
     count: int,
+    seed: int,
 ) -> list[dict[str, Any]]:
     if count > len(episodes):
         raise ValueError("num-episodes exceeds successful test episodes")
-    positions = np.linspace(0, len(episodes) - 1, num=count)
-    return [episodes[int(round(position))] for position in positions]
-
-
-def demonstrations_within_budget(
-    handle: h5py.File,
-    episodes: list[dict[str, Any]],
-    *,
-    budget_env_steps: int,
-) -> list[dict[str, Any]]:
-    eligible = []
-    for episode in episodes:
-        episode_index = int(episode["episode_index"])
-        demonstration_env_steps = int(handle["ep_len"][episode_index]) - 1
-        if demonstration_env_steps <= budget_env_steps:
-            eligible.append(episode)
-    return eligible
+    rng = np.random.default_rng(seed)
+    positions = np.sort(rng.choice(len(episodes), size=count, replace=False))
+    return [episodes[int(position)] for position in positions]
 
 
 def load_environment_record(
@@ -372,7 +366,7 @@ def run_rollout(
     record: dict[str, Any],
     *,
     num_candidates: int,
-    eval_budget_env_steps: int,
+    episode_horizon_env_steps: int,
     flat_horizon: int,
     eta_r: float,
     env_seed: int,
@@ -384,7 +378,7 @@ def run_rollout(
     env = gym.make(
         "swm/TwoRoom-v1",
         render_mode="rgb_array",
-        max_episode_steps=eval_budget_env_steps,
+        max_episode_steps=episode_horizon_env_steps,
         disable_env_checker=True,
     )
     torch.manual_seed(dropout_seed)
@@ -436,13 +430,21 @@ def run_rollout(
         )
         current_distance = initial_distance
 
-        while env_steps < eval_budget_env_steps and not success and not truncated:
+        while (
+            env_steps < episode_horizon_env_steps
+            and not success
+            and not truncated
+        ):
             if method == "flat_rc_lewm":
                 segment_start_distance = current_distance
                 segment_start_latent = history[-1].to(device)
                 segment_env_start = env_steps
                 for _ in range(TAU_MODEL_STEPS):
-                    if env_steps >= eval_budget_env_steps or success or truncated:
+                    if (
+                        env_steps >= episode_horizon_env_steps
+                        or success
+                        or truncated
+                    ):
                         break
                     current_image = env.render()
                     plan = adapter.plan_to_latent(
@@ -455,7 +457,7 @@ def run_rollout(
                     executed, success, truncated, info = execute_action_block(
                         env,
                         plan.actions_to_execute_env_steps[0],
-                        remaining_budget=eval_budget_env_steps - env_steps,
+                        remaining_budget=episode_horizon_env_steps - env_steps,
                     )
                     env_steps += executed
                     if info:
@@ -521,7 +523,7 @@ def run_rollout(
                 executed, success, truncated, info = execute_action_block(
                     env,
                     plan.actions_to_execute_env_steps[0],
-                    remaining_budget=eval_budget_env_steps - env_steps,
+                    remaining_budget=episode_horizon_env_steps - env_steps,
                 )
                 env_steps += executed
                 fallback_steps += 1
@@ -553,7 +555,11 @@ def run_rollout(
             start_distance = current_distance
             start_latent = history[-1].to(device)
             for h_rem in range(TAU_MODEL_STEPS, 0, -1):
-                if env_steps >= eval_budget_env_steps or success or truncated:
+                if (
+                    env_steps >= episode_horizon_env_steps
+                    or success
+                    or truncated
+                ):
                     break
                 current_image = env.render()
                 plan = adapter.plan_to_latent(
@@ -567,7 +573,7 @@ def run_rollout(
                 executed, success, truncated, info = execute_action_block(
                     env,
                     plan.actions_to_execute_env_steps[0],
-                    remaining_budget=eval_budget_env_steps - env_steps,
+                    remaining_budget=episode_horizon_env_steps - env_steps,
                 )
                 env_steps += executed
                 if info:
@@ -729,7 +735,7 @@ def bootstrap_mean_95_ci(
 def across_seed_paired_bootstrap(
     seed_results: list[dict[str, Any]],
     *,
-    eval_budget_env_steps: int,
+    episode_horizon_env_steps: int,
     samples: int,
     seed: int,
 ) -> dict[str, Any]:
@@ -737,11 +743,11 @@ def across_seed_paired_bootstrap(
         raise ValueError("formal Stage 4 comparison requires at least 3 seeds")
     metric_specs = {
         "task_success": (lambda record: float(record["success"]), "higher_is_better"),
-        "budgeted_completion_env_steps": (
+        "horizon_censored_completion_env_steps": (
             lambda record: float(
                 record["completion_env_steps"]
                 if record["completion_env_steps"] is not None
-                else eval_budget_env_steps
+                else episode_horizon_env_steps
             ),
             "lower_is_better",
         ),
@@ -854,10 +860,14 @@ def main() -> int:
     args = parse_args()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
-    if args.num_candidates != 32 or args.num_episodes < 1:
-        raise ValueError("formal Stage 4 requires N=32 and positive episodes")
-    if args.eval_budget_env_steps < 1:
-        raise ValueError("evaluation budget must be positive")
+    if args.num_candidates != 32:
+        raise ValueError("formal Stage 4 requires N=32")
+    if not 100 <= args.num_episodes <= 200:
+        raise ValueError("formal Stage 4 requires 100 to 200 fixed episodes")
+    if args.episode_horizon_env_steps != TWOROOM_OFFICIAL_MAX_EPISODE_STEPS:
+        raise ValueError(
+            "TwoRoom formal evaluation must use the official 100-step horizon"
+        )
     if args.bootstrap_samples < 1:
         raise ValueError("bootstrap-samples must be positive")
     if not 1 <= args.topk <= args.num_samples:
@@ -872,21 +882,17 @@ def main() -> int:
     )
     cache = load_latent_cache(args.latent_cache)
     _, _, test_episodes = split_cached_episodes(cache)
+    selected_episodes = select_episode_records(
+        test_episodes,
+        count=args.num_episodes,
+        seed=args.episode_sample_seed,
+    )
     dataset_path = args.cache_dir.expanduser().resolve() / args.dataset
     with h5py.File(dataset_path, "r") as handle:
-        eligible_episodes = demonstrations_within_budget(
-            handle,
-            test_episodes,
-            budget_env_steps=args.eval_budget_env_steps,
-        )
-        if args.num_episodes > len(eligible_episodes):
-            raise ValueError(
-                f"only {len(eligible_episodes)} test demonstrations finish within "
-                f"the {args.eval_budget_env_steps}-step evaluation budget"
-            )
-        selected_episodes = select_episode_records(
-            eligible_episodes, count=args.num_episodes
-        )
+        held_out_demonstration_env_steps = [
+            int(handle["ep_len"][int(episode["episode_index"])]) - 1
+            for episode in test_episodes
+        ]
         environment_records = [
             load_environment_record(handle, episode) for episode in selected_episodes
         ]
@@ -939,7 +945,7 @@ def main() -> int:
                     adapter,
                     record,
                     num_candidates=args.num_candidates,
-                    eval_budget_env_steps=args.eval_budget_env_steps,
+                    episode_horizon_env_steps=args.episode_horizon_env_steps,
                     flat_horizon=args.flat_planning_horizon_model_steps,
                     eta_r=stage2_protocol["eta_r"],
                     env_seed=args.env_seed,
@@ -984,7 +990,7 @@ def main() -> int:
 
     across_seeds = across_seed_paired_bootstrap(
         all_seed_results,
-        eval_budget_env_steps=args.eval_budget_env_steps,
+        episode_horizon_env_steps=args.episode_horizon_env_steps,
         samples=args.bootstrap_samples,
         seed=args.bootstrap_seed,
     )
@@ -998,15 +1004,22 @@ def main() -> int:
             "episode_indices": [
                 record["episode_index"] for record in environment_records
             ],
+            "episode_sample_seed": args.episode_sample_seed,
             "test_successful_demonstration_count": len(test_episodes),
-            "demonstrations_within_evaluation_budget": len(eligible_episodes),
+            "held_out_demonstration_length_diagnostic": distribution_summary(
+                held_out_demonstration_env_steps
+            ),
             "selected_demonstration_env_steps": [
                 record["demonstration_env_steps"] for record in environment_records
             ],
-            "episode_eligibility": (
-                "successful test demonstration length is no greater than "
-                "eval_budget_env_steps"
+            "selected_demonstration_length_diagnostic": distribution_summary(
+                [
+                    record["demonstration_env_steps"]
+                    for record in environment_records
+                ]
             ),
+            "demonstration_length_used_for_episode_selection": False,
+            "demonstration_length_used_as_per_episode_horizon": False,
             "methods": list(METHODS),
             "tau_model_steps": TAU_MODEL_STEPS,
             "model_step_env_steps": MODEL_STEP_ENV_STEPS,
@@ -1016,7 +1029,11 @@ def main() -> int:
             "eta_r": stage2_protocol["eta_r"],
             "eta_r_source": stage2_protocol["report_path"],
             "num_candidates": args.num_candidates,
-            "eval_budget_env_steps": args.eval_budget_env_steps,
+            "episode_horizon_env_steps": args.episode_horizon_env_steps,
+            "episode_horizon_source": (
+                "official RC-aux eval.py: world.max_episode_steps = "
+                "2 * TwoRoom eval_budget (2 * 50)"
+            ),
             "flat_planning_horizon_model_steps": (
                 args.flat_planning_horizon_model_steps
             ),

@@ -144,10 +144,17 @@ and measure physical progress. It is never passed to the generator, RC, or
 not an Oracle: after the first action block, the real rollout can have left the
 reference trajectory.
 
-The default 50-environment-step comparison samples only successful test
-episodes whose reference demonstration also completes within 50 steps. The
-eligible-pool size and every selected demonstration length are recorded, so an
-insufficient task budget is not counted as a policy failure.
+The closed loop uses the official TwoRoom environment horizon of 100 steps.
+This comes directly from RC-aux `eval.py`, which sets `world.max_episode_steps`
+to twice the TwoRoom `eval_budget` of 50. Demonstration length never controls
+episode eligibility or an individual rollout horizon. It is reported only as a
+description of test-task difficulty.
+
+The formal subset is sampled once, without replacement, from the complete
+held-out successful episode pool `[5000,10000)`. By default the fixed sample has
+150 episodes and uses seed `20260811`. Every method and all three generator
+seeds use exactly these episode indices, the same 100-step horizon, and the same
+CEM seed rule.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 MPLCONFIGDIR=/tmp/matplotlib-rcaux \
@@ -156,12 +163,13 @@ PYTHONPATH=. .venv/bin/python tools/evaluate_stage4_closed_loop.py \
   --cache-dir /home/sxw/work/datasets/stable-wm \
   --stage2-report outputs/rc_filter_only_tau3.json \
   --training-report outputs/stage4_generator_training.json \
-  --num-episodes 50 \
-  --eval-budget-env-steps 50 \
+  --num-episodes 150 \
+  --episode-sample-seed 20260811 \
+  --episode-horizon-env-steps 100 \
   --output outputs/stage4_closed_loop.json
 ```
 
-The formal run contains `3 generator seeds * 5 methods * 50 episodes = 750`
+The formal run contains `3 generator seeds * 5 methods * 150 episodes = 2250`
 rollouts. Primary metrics are task success, completion steps, realized `D_psi`
 progress, fallback rate, and candidate coverage. Euclidean target-distance
 progress is diagnostic only. Reports also include selected RC score, diversity,
