@@ -29,6 +29,7 @@ class RCAuxProfile:
     model_step_env_steps: int
     action_low: tuple[float, ...]
     action_high: tuple[float, ...]
+    low_level_success_radius: float | None = None
 
     def __post_init__(self) -> None:
         if self.image_size < 1 or self.action_dim < 1 or self.model_step_env_steps < 1:
@@ -37,6 +38,11 @@ class RCAuxProfile:
             raise ValueError("action_low length must equal action_dim")
         if len(self.action_high) != self.action_dim:
             raise ValueError("action_high length must equal action_dim")
+        if (
+            self.low_level_success_radius is not None
+            and self.low_level_success_radius <= 0
+        ):
+            raise ValueError("low_level_success_radius must be positive")
 
     @property
     def action_block_dim(self) -> int:
@@ -51,6 +57,19 @@ TWOROOM_PROFILE = RCAuxProfile(
     model_step_env_steps=5,
     action_low=(-1.0, -1.0),
     action_high=(1.0, 1.0),
+    low_level_success_radius=16.0,
+)
+
+
+HRC_TWOROOM_PROFILE = RCAuxProfile(
+    name="hrc_tworoom",
+    dataset_name="tworoom",
+    image_size=224,
+    action_dim=2,
+    model_step_env_steps=5,
+    action_low=(-1.0, -1.0),
+    action_high=(1.0, 1.0),
+    low_level_success_radius=4.0,
 )
 
 
@@ -126,6 +145,7 @@ class PlannerDiagnostics:
     planning_horizon_model_steps: int
     execution_horizon_model_steps: int
     model_step_env_steps: int
+    low_level_success_radius: float | None
     planning_horizon_env_steps: int
     execution_horizon_env_steps: int
     warm_start_source: Literal["none", "previous_plan", "explicit"]
@@ -164,6 +184,7 @@ class PlannerDiagnostics:
             "planning_horizon_model_steps": self.planning_horizon_model_steps,
             "execution_horizon_model_steps": self.execution_horizon_model_steps,
             "model_step_env_steps": self.model_step_env_steps,
+            "low_level_success_radius": self.low_level_success_radius,
             "planning_horizon_env_steps": self.planning_horizon_env_steps,
             "execution_horizon_env_steps": self.execution_horizon_env_steps,
             "warm_start_source": self.warm_start_source,
@@ -1029,6 +1050,7 @@ class RCAuxAdapter:
             planning_horizon_model_steps=planning_horizon,
             execution_horizon_model_steps=execution_horizon,
             model_step_env_steps=self.profile.model_step_env_steps,
+            low_level_success_radius=self.profile.low_level_success_radius,
             planning_horizon_env_steps=planning_horizon_env_steps,
             execution_horizon_env_steps=execution_horizon_env_steps,
             warm_start_source=warm_start_source,
@@ -1076,6 +1098,7 @@ class RCAuxAdapter:
 
 
 __all__ = [
+    "HRC_TWOROOM_PROFILE",
     "PlanResult",
     "PlannerDiagnostics",
     "RCAuxAdapter",

@@ -1,8 +1,8 @@
 # RC Filter-Only Oracle Experiment
 
 This experiment isolates local RC filtering from subgoal progress ranking and
-from a learned subgoal generator. It does not compute `D_phi`, encode a final
-task goal, or rank candidates by progress.
+from a learned subgoal generator. It does not encode a final task goal or rank
+candidates by progress.
 
 ## Stage 1: Strict Oracle Pools
 
@@ -93,7 +93,6 @@ Inspect the decision fields:
 jq '{
   stage1_strict_oracle_pool_validated,
   stage2_rc_filter_validated,
-  ready_for_dphi_ranking_evaluation,
   validation_criteria,
   threshold: (.threshold | del(.calibration_threshold_table)),
   calibration: (.calibration | del(.by_category)),
@@ -115,79 +114,3 @@ The process writes the full JSON report before returning status 1 when Stage 2
 does not pass. A nonzero status can therefore be an experimental result rather
 than a runtime error. `ready_to_train_high_level_generator` remains false because
 the progress ranker has not been evaluated in this experiment.
-
-## Stage 3: D-Phi Ranking Inside Feasible Sets
-
-Stage 3 consumes the completed Stage 2 report. It does not rebuild the RC
-threshold or mix RC classification performance into the primary ranking test.
-The primary candidate set contains candidates whose Stage 2 closed-loop success
-rate is at least `2/3`. The Stage 2 RC-passed set is evaluated separately as a
-deployment diagnostic.
-
-The final goal is the official TwoRoom goal image rendered with the agent at the
-dataset `pos_target`. For every candidate, Stage 3 computes
-
-```text
-D_phi(g_i, z_G) = sum_{h=1..5} (1 - R_phi(g_i, z_G, h)).
-```
-
-The independent target is not coordinate distance. It is a continuous
-obstacle-aware path cost that must pass through a valid door region and explicitly
-accounts for both wall collision boundaries, door size, agent radius, success
-radius, and environment speed. The remaining number of steps in the demonstrated
-trajectory is also reported as a second diagnostic.
-
-The following selectors are compared on exactly the same candidates:
-
-- uniform random selection;
-- minimum `D_phi`;
-- minimum encoder latent squared L2;
-- minimum obstacle-aware target cost, used only as an offline Oracle upper bound.
-
-All Oracle-feasible candidates and any additional RC-passed candidates are
-re-executed with the Stage 2 CEM seeds. This records the real final state and
-allows obstacle-aware progress after execution to be compared without planner
-sampling differences. The script also requires the rerun success rates to match
-the Stage 2 report exactly.
-
-Run Stage 3 on GPU:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 MPLCONFIGDIR=/tmp/matplotlib-rcaux \
-PYTHONPATH=. .venv/bin/python tools/evaluate_dphi_ranking.py \
-  --device cuda \
-  --stage2-report outputs/rc_filter_only_tau3.json \
-  --cache-dir /home/sxw/work/datasets/stable-wm \
-  --feasible-success-rate 0.6666666667 \
-  --min-ranking-trials 30 \
-  --output outputs/dphi_ranking_tau3.json
-```
-
-Inspect the result:
-
-```bash
-jq '{
-  stage3_dphi_ranking_validated,
-  ready_for_combined_stage4_evaluation,
-  ready_to_train_high_level_generator,
-  validation_criteria,
-  rerun_success_rate_max_abs_difference,
-  oracle_feasible_summary,
-  rc_passed_summary
-}' outputs/dphi_ranking_tau3.json
-```
-
-Stage 3 passes only if the Oracle-feasible set contains enough ranking trials,
-rerun outcomes match Stage 2, and paired bootstrap confidence intervals establish
-all of the following:
-
-- `D_phi` pairwise accuracy is above chance;
-- `D_phi` target cost is lower than uniform random selection;
-- `D_phi` real executed progress is higher than uniform random selection;
-- `D_phi` target cost is lower than latent L2 selection;
-- `D_phi` real executed progress is higher than latent L2 selection.
-
-Thus a positive result means that `D_phi` adds value beyond both random feasible
-selection and the simpler latent-distance heuristic. A negative result leaves the
-validated RC filter intact but rejects the current `D_phi` ranking rule. Generator
-training remains disabled until a later combined Stage 4 evaluation passes.

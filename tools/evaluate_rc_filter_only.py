@@ -1056,7 +1056,7 @@ def main() -> int:
     report = {
         "stage1_strict_oracle_pool_validated": True,
         "stage2_rc_filter_validated": stage2_validated,
-        "ready_for_dphi_ranking_evaluation": stage2_validated,
+        "ready_for_next_experiment_design": stage2_validated,
         "ready_to_train_high_level_generator": False,
         "stage1": stage1,
         "validation_criteria": validation_criteria,
@@ -1077,7 +1077,7 @@ def main() -> int:
                 "collision-agnostic displacement lower bound exceeds 15 "
                 "environment steps; obstacles can only increase required effort"
             ),
-            "uses_dphi_or_final_goal_progress": False,
+            "uses_progress_ranking_or_final_goal_progress": False,
             "selection_comparison": [
                 "uniform_all_pool_expected_completion",
                 "uniform_rc_pass_set_expected_completion",

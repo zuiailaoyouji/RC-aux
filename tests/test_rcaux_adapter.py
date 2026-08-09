@@ -7,10 +7,12 @@ import torch
 from torch import nn
 
 from rcaux_adapter import (
+    HRC_TWOROOM_PROFILE,
     RCAuxAdapter,
     RCAuxPlannerConfig,
     RCAuxProfile,
     ReachabilityDiagnostics,
+    TWOROOM_PROFILE,
 )
 
 
@@ -148,6 +150,11 @@ def test_hierarchical_default_executes_one_model_step():
     assert RCAuxPlannerConfig().execution_horizon_model_steps == 1
 
 
+def test_hrc_profile_keeps_low_level_radius_separate_from_official_benchmark():
+    assert HRC_TWOROOM_PROFILE.low_level_success_radius == 4.0
+    assert TWOROOM_PROFILE.low_level_success_radius == 16.0
+
+
 def test_encode_observation_returns_btd_latent():
     adapter = make_adapter()
     image = np.zeros((224, 224, 3), dtype=np.uint8)
@@ -237,6 +244,7 @@ def test_latent_goal_is_primary_and_steps_are_explicit():
     assert result.diagnostics.execution_horizon_model_steps == 1
     assert result.diagnostics.planning_horizon_env_steps == 4
     assert result.diagnostics.execution_horizon_env_steps == 2
+    assert result.diagnostics.low_level_success_radius is None
     assert result.diagnostics.to_log_dict()["profile_name"] == "test"
     json.dumps(result.diagnostics.to_log_dict())
 
