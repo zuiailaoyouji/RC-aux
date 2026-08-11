@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the formal Stage 4 closed-loop comparison in TwoRoom."""
+"""ARCHIVED: reproduce the retired Stage 4 closed-loop comparison."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import gymnasium as gym
 import h5py
@@ -23,18 +23,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rcaux_adapter import RCAuxAdapter, RCAuxPlannerConfig, TWOROOM_PROFILE
+from legacy_stage4_protocol import (
+    assert_protocol_consistency,
+    load_checkpoint_protocol,
+    load_stage2_protocol,
+)
 from stage4_generator import (
     MODEL_STEP_ENV_STEPS,
     TAU_MODEL_STEPS,
-    assert_protocol_consistency,
     distribution_summary,
     left_padded_history,
-    load_checkpoint_protocol,
     load_generator_checkpoint,
     load_latent_cache,
-    load_stage2_protocol,
     sample_subgoal_candidates,
-    select_candidate_index,
     split_cached_episodes,
 )
 from tools.evaluate_stage4_candidates import (
@@ -49,6 +50,17 @@ METHODS = (
     "stochastic32_dpsi_no_rc",
     "stochastic32_rc_dpsi",
     "flat_rc_lewm",
+)
+ABLATION_RC_NO_DIRECT = "stochastic32_rc_dpsi_no_direct"
+ABLATION_DIRECT_ONLY_RC = "stochastic32_dpsi_direct_rc"
+ABLATION_METHODS = (
+    ABLATION_RC_NO_DIRECT,
+    ABLATION_DIRECT_ONLY_RC,
+)
+STOCHASTIC_METHODS = (
+    "stochastic32_dpsi_no_rc",
+    "stochastic32_rc_dpsi",
+    *ABLATION_METHODS,
 )
 TWOROOM_OFFICIAL_MAX_EPISODE_STEPS = 100
 DEFAULT_FORMAL_EPISODES = 150
@@ -198,7 +210,10 @@ def choose_subgoal(
     num_candidates: int,
     eta_r: float,
     device: torch.device,
+    candidate_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor | None, dict[str, Any]]:
+    if method not in (*METHODS, *ABLATION_METHODS):
+        raise ValueError(f"unknown Stage 4 method: {method}")
     current = history[-1].to(device)
     goal = goal.to(device)
     diagnostics = {
@@ -233,6 +248,8 @@ def choose_subgoal(
         diagnostics["timing_seconds"]["generator"] = time.perf_counter() - started
         diagnostics["candidate_count"] = 1
     else:
+        if method not in STOCHASTIC_METHODS:
+            raise ValueError(f"method does not define a subgoal selector: {method}")
         history_tensor, mask = left_padded_history(history)
         synchronize(device)
         started = time.perf_counter()
@@ -244,6 +261,13 @@ def choose_subgoal(
             num_candidates=num_candidates,
             stochastic=True,
         )[0]
+        if candidate_transform is not None:
+            transformed = candidate_transform(candidates)
+            if transformed.shape != candidates.shape:
+                raise ValueError(
+                    "candidate_transform must preserve candidate shape [N,D]"
+                )
+            candidates = transformed.to(device=device, dtype=candidates.dtype)
         synchronize(device)
         diagnostics["timing_seconds"]["generator"] = time.perf_counter() - started
         diagnostics["candidate_count"] = num_candidates
@@ -261,47 +285,64 @@ def choose_subgoal(
         progress = source_score - candidate_score
         synchronize(device)
         diagnostics["timing_seconds"]["d_psi"] = time.perf_counter() - started
-        if method == "stochastic32_rc_dpsi":
+        filter_generated_with_rc = method in (
+            "stochastic32_rc_dpsi",
+            ABLATION_RC_NO_DIRECT,
+        )
+        include_direct_goal = method in (
+            "stochastic32_rc_dpsi",
+            ABLATION_DIRECT_ONLY_RC,
+        )
+        if (
+            filter_generated_with_rc or include_direct_goal
+        ) and not 0.0 <= eta_r <= 1.0:
+            raise ValueError("a valid Stage 2 eta_r is required for RC filtering")
+        rc = None
+        direct_goal_rc = None
+        if filter_generated_with_rc or include_direct_goal:
             synchronize(device)
             started = time.perf_counter()
-            rc = adapter.reachability(
-                current.unsqueeze(0),
-                candidates.unsqueeze(0),
-                horizon_model_steps=TAU_MODEL_STEPS,
-            )[0]
-            direct_goal_rc = adapter.reachability(
-                current.unsqueeze(0),
-                goal.unsqueeze(0),
-                horizon_model_steps=TAU_MODEL_STEPS,
-            )[0]
+            if filter_generated_with_rc:
+                rc = adapter.reachability(
+                    current.unsqueeze(0),
+                    candidates.unsqueeze(0),
+                    horizon_model_steps=TAU_MODEL_STEPS,
+                )[0]
+            if include_direct_goal:
+                direct_goal_rc = adapter.reachability(
+                    current.unsqueeze(0),
+                    goal.unsqueeze(0),
+                    horizon_model_steps=TAU_MODEL_STEPS,
+                )[0]
             synchronize(device)
             diagnostics["timing_seconds"]["rc"] = time.perf_counter() - started
+
+        if include_direct_goal:
             combined_score = torch.cat(
                 [candidate_score, direct_goal_score.unsqueeze(0)]
             )
-            combined_rc = torch.cat([rc, direct_goal_rc.unsqueeze(0)])
-            selection = select_candidate_index(
-                combined_score,
-                source_score,
-                rc_scores=combined_rc,
-                eta_r=eta_r,
-            )
-            feasible = selection["feasible"]
-            diagnostics["rc_pass_count"] = int(selection["rc_pass"][:-1].sum())
-            diagnostics["rc_and_progress_count"] = int(feasible[:-1].sum())
-            diagnostics["direct_goal_eligible"] = bool(feasible[-1])
         else:
-            rc = None
-            selection = select_candidate_index(
-                candidate_score, source_score, rc_scores=None
-            )
-            feasible = selection["feasible"]
-            diagnostics["rc_and_progress_count"] = int(feasible.sum())
+            combined_score = candidate_score
+
+        progress_pass = combined_score < source_score
+        feasibility_pass = torch.ones_like(progress_pass, dtype=torch.bool)
+        if filter_generated_with_rc:
+            feasibility_pass[:num_candidates] = rc >= eta_r
+            diagnostics["rc_pass_count"] = int((rc >= eta_r).sum())
+        if include_direct_goal:
+            feasibility_pass[-1] = direct_goal_rc >= eta_r
+        feasible = progress_pass & feasibility_pass
+        diagnostics["rc_and_progress_count"] = int(
+            feasible[:num_candidates].sum()
+        )
+        if include_direct_goal:
+            diagnostics["direct_goal_eligible"] = bool(feasible[-1])
         if not bool(feasible.any()):
             diagnostics["coverage"] = False
             return None, diagnostics
-        selected_index = int(selection["selected_index"])
-        if rc is not None and selected_index == num_candidates:
+        masked_scores = combined_score.masked_fill(~feasible, torch.inf)
+        selected_index = int(masked_scores.argmin())
+        if include_direct_goal and selected_index == num_candidates:
             selected = goal
             diagnostics["direct_goal_selected"] = True
             diagnostics["selected_d_psi_progress"] = float(
@@ -374,6 +415,8 @@ def run_rollout(
     dropout_seed: int,
     max_replay_pixel_diff: int,
     device: torch.device,
+    candidate_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    reseed_dropout_each_high_level_attempt: bool = False,
 ) -> dict[str, Any]:
     env = gym.make(
         "swm/TwoRoom-v1",
@@ -484,6 +527,11 @@ def run_rollout(
                 continue
 
             high_level_attempts += 1
+            if reseed_dropout_each_high_level_attempt:
+                attempt_seed = dropout_seed + high_level_attempts - 1
+                torch.manual_seed(attempt_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(attempt_seed)
             subgoal, diagnostics = choose_subgoal(
                 method,
                 generator,
@@ -496,6 +544,7 @@ def run_rollout(
                 num_candidates=num_candidates,
                 eta_r=eta_r,
                 device=device,
+                candidate_transform=candidate_transform,
             )
             for key in ("generator", "rc", "d_psi"):
                 timing[key] += diagnostics["timing_seconds"][key]
@@ -1037,6 +1086,14 @@ def main() -> int:
             "flat_planning_horizon_model_steps": (
                 args.flat_planning_horizon_model_steps
             ),
+            "num_samples": args.num_samples,
+            "cem_iterations": args.cem_iterations,
+            "topk": args.topk,
+            "cem_seed": args.cem_seed,
+            "env_seed": args.env_seed,
+            "dropout_seed": args.dropout_seed,
+            "reachability_cost_weight": args.reachability_cost_weight,
+            "max_replay_pixel_diff": args.max_replay_pixel_diff,
             "fallback": "flat z_T for one model step, then retry high level",
             "direct_goal_precheck": (
                 "include z_T in the complete selector when RC passes and "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and validate the Stage 3 latent progress ranker."""
+"""ARCHIVED: train and validate the retired Stage 3 D_psi ranker."""
 
 from __future__ import annotations
 

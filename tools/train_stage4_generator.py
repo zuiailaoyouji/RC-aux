@@ -22,15 +22,12 @@ from stage4_generator import (
     GeneratorTrajectoryDataset,
     HighLevelSubgoalGenerator,
     TAU_MODEL_STEPS,
-    assert_protocol_consistency,
     atomic_torch_save,
     build_generator_sample_refs,
     compute_residual_statistics,
     generator_checkpoint,
     generator_loss,
-    load_checkpoint_protocol,
     load_latent_cache,
-    load_stage2_protocol,
     split_cached_episodes,
 )
 
@@ -43,16 +40,6 @@ def parse_args() -> argparse.Namespace:
         "--latent-cache",
         type=Path,
         default=Path("outputs/stage3_progress_latents.pt"),
-    )
-    parser.add_argument(
-        "--stage2-report",
-        type=Path,
-        default=Path("outputs/rc_filter_only_tau3.json"),
-    )
-    parser.add_argument(
-        "--progress-ranker",
-        type=Path,
-        default=Path("outputs/stage3_progress_ranker.pt"),
     )
     parser.add_argument("--seeds", default="3072,3073,3074")
     parser.add_argument("--batch-size", type=int, default=512)
@@ -298,13 +285,6 @@ def atomic_write_json(value: dict[str, Any], path: Path) -> None:
 def main() -> int:
     args = parse_args()
     seeds = validate_args(args)
-    stage2_protocol = load_stage2_protocol(args.stage2_report)
-    stage3_protocol = load_checkpoint_protocol(args.progress_ranker, stage=3)
-    assert_protocol_consistency(
-        stage2_protocol,
-        stage3_protocol,
-        checkpoint_label="Stage 3 progress ranker",
-    )
     cache = load_latent_cache(args.latent_cache)
     train_episodes, validation_episodes, test_episodes = split_cached_episodes(
         cache
@@ -321,9 +301,6 @@ def main() -> int:
         "latent_cache": str(args.latent_cache.expanduser().resolve()),
         "latent_cache_policy": cache["metadata"].get("policy"),
         "tau_model_steps": TAU_MODEL_STEPS,
-        "eta_r": stage2_protocol["eta_r"],
-        "eta_r_source": stage2_protocol["report_path"],
-        "stage3_progress_ranker": stage3_protocol["checkpoint_path"],
         "train_episode_range": {"start_inclusive": 0, "end_exclusive": 4000},
         "validation_episode_range": {
             "start_inclusive": 4000,
@@ -344,6 +321,7 @@ def main() -> int:
         "future_information_used_as_input": False,
         "loss_terms": ["smooth_l1", "0.1 * cosine_distance"],
         "rc_or_progress_loss_used": False,
+        "external_selector_artifacts_loaded": False,
     }
     seed_results = []
     for seed in seeds:
@@ -370,7 +348,12 @@ def main() -> int:
 
     report = {
         "stage4_generator_training_complete": len(seed_results) == len(seeds),
-        "frozen_modules": ["E_theta", "F_theta", "R_phi", "D_psi"],
+        "frozen_modules": [
+            "RC-aux Encoder",
+            "RC-aux world model",
+            "RC-LeWM including low-level R_local",
+            "R_G (trained separately in Stage 5A)",
+        ],
         "protocol": metadata,
         "optimizer": {
             "type": "AdamW",

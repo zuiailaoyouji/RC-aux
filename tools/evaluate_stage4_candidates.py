@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline Stage 4 generator and candidate-filter validation."""
+"""ARCHIVED: evaluate the retired Stage 4 R_local + D_psi selector."""
 
 from __future__ import annotations
 
@@ -21,18 +21,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rcaux_adapter import RCAuxAdapter, TWOROOM_PROFILE
+from legacy_stage4_protocol import (
+    assert_protocol_consistency,
+    load_checkpoint_protocol,
+    load_stage2_protocol,
+    select_candidate_index,
+)
 from stage4_generator import (
     GeneratorTrajectoryDataset,
     TAU_MODEL_STEPS,
-    assert_protocol_consistency,
     build_generator_sample_refs,
     distribution_summary,
-    load_checkpoint_protocol,
     load_generator_checkpoint,
     load_latent_cache,
-    load_stage2_protocol,
     sample_subgoal_candidates,
-    select_candidate_index,
     split_cached_episodes,
 )
 from tools.train_progress_ranker_stage3 import ProgressRanker

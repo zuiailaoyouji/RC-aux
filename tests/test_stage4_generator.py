@@ -6,27 +6,38 @@ import pytest
 import torch
 from torch import nn
 
+from legacy_stage4_protocol import (
+    assert_protocol_consistency,
+    load_checkpoint_protocol,
+    load_stage2_protocol,
+    select_candidate_index,
+)
 from stage4_generator import (
     GeneratorTrajectoryDataset,
     HighLevelSubgoalGenerator,
-    assert_protocol_consistency,
     build_generator_sample_refs,
     enable_generator_dropout_only,
     generator_loss,
     left_padded_history,
-    load_checkpoint_protocol,
-    load_stage2_protocol,
     sample_subgoal_candidates,
-    select_candidate_index,
     split_cached_episodes,
 )
 from tools.evaluate_stage4_closed_loop import (
+    ABLATION_DIRECT_ONLY_RC,
+    ABLATION_RC_NO_DIRECT,
     METHODS,
     TWOROOM_OFFICIAL_MAX_EPISODE_STEPS,
     across_seed_paired_bootstrap,
     choose_subgoal,
     reference_trajectory_waypoint,
     select_episode_records,
+)
+from tools.evaluate_stage4_ablations import (
+    ABLATION_DIRECT_ONLY_RC as FACTORIAL_DIRECT_ONLY_RC,
+    ABLATION_RC_NO_DIRECT as FACTORIAL_RC_NO_DIRECT,
+    NO_RC_NO_DIRECT,
+    RC_AND_DIRECT,
+    factorial_bootstrap,
 )
 from tools.train_stage4_generator import parse_seeds
 
@@ -249,6 +260,106 @@ def test_complete_selector_can_choose_direct_terminal_goal(monkeypatch):
     assert diagnostics["direct_goal_selected"] is True
 
 
+def test_rc_without_direct_filters_only_generated_candidates(monkeypatch):
+    candidates = torch.zeros(1, 2, 192)
+    candidates[0, 0, 0] = 3.0
+    candidates[0, 1, 0] = 2.0
+
+    monkeypatch.setattr(
+        "tools.evaluate_stage4_closed_loop.sample_subgoal_candidates",
+        lambda *args, **kwargs: candidates,
+    )
+
+    class Ranker:
+        def __call__(self, source, goal):
+            return source[:, 0]
+
+    class Adapter:
+        calls = 0
+
+        def reachability(self, source, target, horizon_model_steps):
+            self.calls += 1
+            assert target.ndim == 3
+            return torch.tensor([[0.9, 0.1]])
+
+    adapter = Adapter()
+    current = torch.zeros(192)
+    current[0] = 4.0
+    goal = torch.zeros(192)
+    goal[0] = 1.0
+
+    selected, diagnostics = choose_subgoal(
+        ABLATION_RC_NO_DIRECT,
+        object(),
+        Ranker(),
+        adapter,
+        deque([current], maxlen=3),
+        goal,
+        {},
+        env_steps_executed=0,
+        num_candidates=2,
+        eta_r=0.5,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(selected, candidates[0, 0])
+    assert diagnostics["rc_pass_count"] == 1
+    assert diagnostics["direct_goal_eligible"] is False
+    assert diagnostics["direct_goal_selected"] is False
+    assert adapter.calls == 1
+
+
+def test_direct_only_rc_does_not_filter_generated_candidates(monkeypatch):
+    candidates = torch.zeros(1, 2, 192)
+    candidates[0, 0, 0] = 3.0
+    candidates[0, 1, 0] = 2.0
+
+    monkeypatch.setattr(
+        "tools.evaluate_stage4_closed_loop.sample_subgoal_candidates",
+        lambda *args, **kwargs: candidates,
+    )
+
+    class Ranker:
+        def __call__(self, source, goal):
+            return source[:, 0]
+
+    class Adapter:
+        generated_pool_queries = 0
+
+        def reachability(self, source, target, horizon_model_steps):
+            if target.ndim == 3:
+                self.generated_pool_queries += 1
+                raise AssertionError("generated candidates must not receive RC")
+            score = 0.4 if float(target[0, 0]) == 1.0 else 0.1
+            return torch.tensor([score])
+
+    adapter = Adapter()
+    current = torch.zeros(192)
+    current[0] = 4.0
+    goal = torch.zeros(192)
+    goal[0] = 1.0
+
+    selected, diagnostics = choose_subgoal(
+        ABLATION_DIRECT_ONLY_RC,
+        object(),
+        Ranker(),
+        adapter,
+        deque([current], maxlen=3),
+        goal,
+        {},
+        env_steps_executed=0,
+        num_candidates=2,
+        eta_r=0.5,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(selected, candidates[0, 1])
+    assert diagnostics["rc_pass_count"] is None
+    assert diagnostics["direct_goal_eligible"] is False
+    assert diagnostics["selected_rc_score"] == pytest.approx(0.1)
+    assert adapter.generated_pool_queries == 0
+
+
 def test_stage2_threshold_must_match_stage3_and_stage4_metadata(tmp_path):
     stage2_path = tmp_path / "stage2.json"
     stage2_path.write_text(
@@ -360,6 +471,71 @@ def test_paired_bootstrap_aggregates_seeds_within_matched_episodes():
     assert report["generator_seed_count"] == 3
     assert success_difference["paired_episode_count"] == 2
     assert success_difference["mean"] == pytest.approx(1.0)
+
+
+def test_factorial_bootstrap_reports_the_two_independent_effects():
+    methods = (
+        NO_RC_NO_DIRECT,
+        FACTORIAL_RC_NO_DIRECT,
+        FACTORIAL_DIRECT_ONLY_RC,
+        RC_AND_DIRECT,
+    )
+    seed_results = []
+    for generator_seed in (1, 2, 3):
+        rollouts = []
+        for episode_index in (5001, 5002):
+            for method in methods:
+                generated_rc = method in (FACTORIAL_RC_NO_DIRECT, RC_AND_DIRECT)
+                rollouts.append(
+                    {
+                        "episode_index": episode_index,
+                        "method": method,
+                        "success": generated_rc,
+                        "completion_env_steps": 30 if generated_rc else None,
+                        "fallback_rate": 0.1 if generated_rc else 0.2,
+                        "candidate_coverage": 0.8 if generated_rc else 0.7,
+                        "total_d_psi_realized_progress": (
+                            2.0 if generated_rc else 1.0
+                        ),
+                        "selected_rc_scores": [],
+                        "selected_d_psi_progress": [],
+                        "candidate_diversities": [],
+                        "segments": [
+                            {
+                                "euclidean_target_distance_progress": 0.0,
+                                "d_psi_progress": 0.0,
+                            }
+                        ],
+                        "high_level_attempts": 1,
+                        "covered_high_level_attempts": int(generated_rc),
+                        "fallback_model_steps": int(not generated_rc),
+                        "direct_goal_eligible_attempts": 0,
+                        "direct_goal_selected_attempts": 0,
+                        "timing_seconds": {
+                            "generator": 0.0,
+                            "rc": 0.0,
+                            "d_psi": 0.0,
+                            "cem": 0.0,
+                        },
+                    }
+                )
+        seed_results.append(
+            {"generator_seed": generator_seed, "rollouts": rollouts}
+        )
+
+    report = factorial_bootstrap(seed_results, samples=100, seed=11)
+
+    generated_rc_effect = report["paired_factorial_effects_95_ci"][
+        "generated_rc_effect_without_direct_goal"
+    ]["task_success"]
+    direct_goal_effect = report["paired_factorial_effects_95_ci"][
+        "direct_goal_effect_without_generated_rc"
+    ]["task_success"]
+    assert generated_rc_effect["mean"] == pytest.approx(1.0)
+    assert generated_rc_effect["difference"] == (
+        f"{FACTORIAL_RC_NO_DIRECT} minus {NO_RC_NO_DIRECT}"
+    )
+    assert direct_goal_effect["mean"] == pytest.approx(0.0)
 
 
 def test_reference_waypoint_uses_demonstration_t_plus_three_or_terminal():

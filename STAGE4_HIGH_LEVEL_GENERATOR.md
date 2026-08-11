@@ -1,8 +1,12 @@
 # Stage 4: High-Level Latent Subgoal Generator
 
-Stage 4 trains only the high-level generator. `E_theta`, `F_theta`, `R_phi`,
-and `D_psi` remain frozen. The local subgoal budget is fixed to three RC-aux
-model steps, or three action blocks and 15 TwoRoom environment steps.
+> **Generator training remains reusable; selection experiments below are
+> archived.** The old `R_local + D_psi` selector is not the current method.
+> Deployment is defined in `HRC_LEWM_HIGH_LEVEL.md`.
+
+Stage 4 trains only the high-level generator. The RC-aux Encoder, world model,
+and low-level RC-LeWM remain frozen. The duration token is fixed to three
+RC-aux model steps, or three action blocks and 15 TwoRoom environment steps.
 
 ## Supervision And Splits
 
@@ -42,14 +46,15 @@ The loss is exactly:
 SmoothL1(g_hat, z_{t+3}) + 0.1 * (1 - cosine(g_hat, z_{t+3})).
 ```
 
-There is no RC or `D_psi` training loss. AdamW uses learning rate `3e-4`, weight
+There is no reachability or progress-ranking training loss. AdamW uses learning rate `3e-4`, weight
 decay `1e-4`, batch size 512, gradient clipping 1, and at most 30 epochs. The
 minimum validation SmoothL1 checkpoint is retained with patience 5.
 
-`eta_R` is never hard-coded by Stage 4. It is loaded from the validated Stage 2
-report. Stage 4 asserts that the Stage 3 ranker checkpoint has the same `eta_R`
-and `tau`, then writes both values into every generator checkpoint. Evaluation
-also checks every Stage 4 checkpoint against Stage 2 and Stage 3 before use.
+Generator training has no Stage 2 report or Stage 3 ranker dependency. Its
+checkpoint records the duration token and generator data split only. The
+current latent-cache filename still contains `stage3` for artifact
+compatibility; the file supplies frozen Encoder latents, not a progress-ranker
+model or score.
 
 ## Train Three Seeds
 
@@ -58,8 +63,6 @@ CUDA_VISIBLE_DEVICES=0 MPLCONFIGDIR=/tmp/matplotlib-rcaux \
 PYTHONPATH=. .venv/bin/python tools/train_stage4_generator.py \
   --device cuda \
   --latent-cache outputs/stage3_progress_latents.pt \
-  --stage2-report outputs/rc_filter_only_tau3.json \
-  --progress-ranker outputs/stage3_progress_ranker.pt \
   --seeds 3072,3073,3074 \
   --output outputs/stage4_generator_training.json
 ```
@@ -67,7 +70,10 @@ PYTHONPATH=. .venv/bin/python tools/train_stage4_generator.py \
 Checkpoints are written under `outputs/stage4_generator_checkpoints/` and are
 selected independently for every seed.
 
-## Offline Candidate Validation
+## Historical Offline Candidate Validation
+
+The remainder of this document reproduces the retired Stage 4 selector. It is
+not the final high-level method.
 
 Inference keeps `E_theta`, `F_theta`, `R_phi`, and `D_psi` in evaluation mode.
 Only generator dropout is enabled for stochastic sampling. For each test source,
@@ -177,6 +183,47 @@ and generator/RC/`D_psi`/CEM time. Results are aggregated across all generator
 seeds. Paired bootstrap 95% intervals use episode as the resampling unit,
 average seeds within each episode, and compare the complete selector with every
 baseline on identical episodes.
+
+## RC And Direct-Goal Factorial Ablation
+
+The original comparison changes two selector components at once: its no-RC
+method has neither generated-candidate RC filtering nor a direct-goal precheck,
+while the complete method has both. Two additional cells isolate their effects:
+
+| Method | RC-filter generated candidates | RC-precheck direct `z_T` |
+|---|---:|---:|
+| `stochastic32_dpsi_no_rc` | no | no |
+| `stochastic32_rc_dpsi_no_direct` | yes | no |
+| `stochastic32_dpsi_direct_rc` | no | yes |
+| `stochastic32_rc_dpsi` | yes | yes |
+
+`stochastic32_rc_dpsi_no_direct` completely excludes `z_T` from the selection
+pool. `stochastic32_dpsi_direct_rc` applies positive `D_psi` progress to all 32
+generated candidates without RC-filtering them; `z_T` is admitted separately
+only when its own RC score passes `eta_R` and its predicted progress is positive.
+All feasible entries are still ranked by minimum `D_psi`.
+
+The dedicated runner reads the exact 150 episode indices and three generator
+checkpoints from the completed baseline report. It retains the official
+100-environment-step horizon, matched CEM/dropout seed rules, fallback, and the
+fixed-subgoal `H_plan=3,2,1`, `H_exec=1` execution protocol. It reuses the two
+existing cells and runs only the two missing cells, for 900 new rollouts. A
+partial report is written after every rollout and is resumed automatically by
+rerunning the same command.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 MPLCONFIGDIR=/tmp/matplotlib-rcaux \
+PYTHONPATH=. .venv/bin/python tools/evaluate_stage4_ablations.py \
+  --device cuda \
+  --cache-dir /home/sxw/work/datasets/stable-wm \
+  --baseline-report outputs/stage4_closed_loop.json \
+  --output outputs/stage4_rc_direct_ablations.json
+```
+
+The report gives paired bootstrap 95% intervals for four contrasts: generated
+RC with and without direct-goal precheck, and direct-goal precheck with and
+without generated-candidate RC. For every episode, the three generator seeds
+are averaged before episode-level bootstrap resampling.
 
 ## Decision Order
 

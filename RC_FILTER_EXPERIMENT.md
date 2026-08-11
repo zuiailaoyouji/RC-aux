@@ -1,5 +1,10 @@
 # RC Filter-Only Oracle Experiment
 
+> **Archived Stage 1/2 diagnostic.** This document validates the original
+> finite-budget head as a local classifier. Its `eta_R` is not used by the
+> current high-level selector. The same head remains active inside low-level
+> RC-LeWM planning.
+
 This experiment isolates local RC filtering from subgoal progress ranking and
 from a learned subgoal generator. It does not encode a final task goal or rank
 candidates by progress.

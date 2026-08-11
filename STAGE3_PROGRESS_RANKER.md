@@ -1,5 +1,10 @@
 # Stage 3: Latent Progress Ranker
 
+> **Archived diagnostic.** `D_psi` is not part of the current HRC-LeWM method
+> and is not a deployment dependency. This document is retained only to
+> reproduce the historical experiment; see `HRC_LEWM_HIGH_LEVEL.md` for the
+> active design.
+
 Stage 3 trains and validates only the long-range latent progress ranker
 `D_psi`. The released RC-aux Encoder and reachability head `R_phi` remain
 frozen. This stage has no environment execution and does not change the Stage 2

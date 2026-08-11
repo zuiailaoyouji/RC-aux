@@ -1,5 +1,11 @@
 # RC-aux Low-Level Adapter
 
+The current high-level policy is implemented separately in
+`hrc_lewm_high_level.py` and documented in `HRC_LEWM_HIGH_LEVEL.md`. It sends
+raw Generator candidates through the horizon-free `R_G` selector before
+calling this adapter. It does not use `RCAuxAdapter.reachability` as a
+high-level gate.
+
 Higher-level integrations can use `RCAuxAdapter` instead of depending on the
 pickled checkpoint layout or `stable-worldmodel` policy internals:
 
@@ -48,6 +54,11 @@ in `[0, 1]`, and apply the official ImageNet preprocessing internally.
 `predict_latents` accepts aligned latent/action history plus optional future
 action blocks and performs an open-loop rollout. `reachability` returns
 probabilities by default; pass `return_logits=True` for raw logits.
+
+This `reachability` method exposes the checkpoint's budget-conditioned
+`R_local(z,g,h)`. It remains part of low-level RC-LeWM cost and diagnostics and
+must not be removed. High-level competence filtering and ranking use the
+separate horizon-free `R_G(z,g)` module.
 
 The latent-goal planner also uses the checkpoint's RC-aux
 `rollout_open_loop`. For an observation history `[B,L,C,H,W]`, where `1<=L<=3`,
